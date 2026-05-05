@@ -1,8 +1,9 @@
 // main.rs
 use crate::log::LogWriter;
 use std::collections::HashMap;
-use std::fs::{File, OpenOptions};
-use std::io::{self, stdin, BufRead, BufReader, ErrorKind, Read, Write};
+use std::fs::OpenOptions;
+use std::io::{stdin, ErrorKind, Read, Seek};
+use std::os::windows::fs::FileExt;
 
 pub mod log;
 // pub mod store;
@@ -15,13 +16,16 @@ impl Index {
         Index(HashMap::new())
     }
     pub fn insert(&mut self, key: Vec<u8>, value_offset: u64, value_len: usize) {
-        self.insert(key, value_offset, value_len);
+        self.0.insert(key, (value_offset, value_len));
+    }
+    pub fn get(&self, key: &[u8]) -> Option<&(u64, usize)> {
+        self.0.get(key)
     }
 }
 
 fn main() -> std::io::Result<()> {
     let log_path = "kestrel.log";
-    let mut store = HashMap::new();
+    let mut index = Index::new();
 
     let mut file = OpenOptions::new()
         .create(true)
@@ -37,16 +41,14 @@ fn main() -> std::io::Result<()> {
             }
             Err(e) => return Err(e),
         };
-        // let val_len = read_u32(&mut file)? as usize;
         let val_len = match read_u32(&mut file) {
             Ok(n) => n as usize,
             Err(e) if e.kind() == ErrorKind::UnexpectedEof => {
-                eprintln!("Incomplete or partial record entry at EOF; discarding");
+                eprintln!("Incomplete or partial record entry in log; discarding");
                 break;
             }
             Err(e) => return Err(e),
         };
-
         let key = match read_bytes(&mut file, key_len)? {
             Some(data) => data,
             None => {
@@ -54,21 +56,13 @@ fn main() -> std::io::Result<()> {
                 break;
             }
         };
-        let value = match read_bytes(&mut file, val_len)? {
-            Some(data) => data,
-            None => {
-                eprintln!("Incomplete or partial record entry in log; discarding");
-                break;
-            }
-        };
 
-        let key_str = String::from_utf8_lossy(&key).into_owned();
-        let val_str = String::from_utf8_lossy(&value).into_owned();
-        store.insert(key_str, val_str);
+        let value_offset = file.stream_position()?;
+        index.insert(key, value_offset, val_len);
     }
 
     let mut log_writer = LogWriter::new(log_path)?;
-    log_writer.set_batch_size(1000);
+    log_writer.set_batch_size(1);
     loop {
         let mut input = String::new();
         stdin().read_line(&mut input)?;
@@ -84,16 +78,22 @@ fn main() -> std::io::Result<()> {
                 let key = parts.next().unwrap_or_default().to_string();
                 let value = parts.next().unwrap_or_default().to_string();
 
-                // update store
-                store.insert(key.clone(), value.clone());
+                let (value_offset, value_len) =
+                    log_writer.write_entry(&key.clone().into_bytes(), &value.into_bytes())?;
 
-                log_writer.write_entry(&key.into_bytes(), &value.into_bytes())?;
+                index.insert(key.clone().into_bytes(), value_offset, value_len);
                 log_writer.maybe_sync()?;
             }
             Some("GET") => {
                 let key = parts.next().unwrap_or_default().to_string();
-                match store.get(&key) {
-                    Some(val) => println!("{}", val),
+                match index.get(&key.clone().into_bytes()) {
+                    Some((val_offset, val_len)) => {
+                        let _file = OpenOptions::new().read(true).open(log_path)?;
+                        let mut buf = vec![0u8; *val_len];
+                        _file.seek_read(&mut buf, *val_offset)?;
+                        println!("{:?}", buf);
+                        println!("{:?}", String::from_utf8_lossy(&buf));
+                    }
                     None => eprintln!("Value for key '{}' not found", key),
                 }
             }
