@@ -2,7 +2,7 @@
 use crate::log::LogWriter;
 use std::collections::HashMap;
 use std::fs::{self, OpenOptions};
-use std::io::{stdin, ErrorKind, Read, Seek};
+use std::io::{stdin, BufWriter, ErrorKind, Read, Seek, Write};
 use std::os::windows::fs::FileExt;
 
 pub mod log;
@@ -73,6 +73,7 @@ pub const BASE_LOG_NAME: &str = "basicdb";
 
 fn main() -> std::io::Result<()> {
     let mut index = Index::new();
+    // SET IT TO HIGHEST SEGMENT ID IN CURRENT DIRECTORY
     index.set_segment_id();
 
     for seg_id in 0..=index.get_segment_id() {
@@ -169,6 +170,91 @@ fn main() -> std::io::Result<()> {
                 }
             }
 
+            Some("COMPACT") => {
+                log_writer.flush_and_sync();
+                let compact_file = OpenOptions::new()
+                    .append(true)
+                    .create(true)
+                    .open(get_compact_log_path())?;
+
+                {
+                    let mut compact_file_writer = BufWriter::new(compact_file);
+                    for (key, val) in index.map.iter() {
+                        let (val_offset, val_len, segment_num) = val;
+
+                        let segment_file = OpenOptions::new()
+                            .read(true)
+                            .open(get_log_path(segment_num))?;
+                        let mut value_buf = vec![0u8; *val_len];
+                        segment_file.seek_read(&mut value_buf, *val_offset)?;
+
+                        compact_file_writer.write_all(&(key.len() as u32).to_be_bytes())?;
+                        compact_file_writer.write_all(&(*val_len as u32).to_be_bytes())?;
+                        compact_file_writer.write_all(key)?;
+                        compact_file_writer.write_all(&value_buf)?;
+
+                        compact_file_writer.flush()?;
+                    }
+                    compact_file_writer.get_ref().sync_all()?;
+                }
+                // REMOVE OLD LOGS
+                for seg_num in 0..=index.get_segment_id() {
+                    let log_path = get_log_path(&seg_num);
+                    std::fs::remove_file(log_path)?;
+                }
+                // RENAME COMPACT LOG TO basicdb0.log
+                std::fs::rename(get_compact_log_path(), get_log_path(&0))?;
+
+                // CLEAR AND REBUILD INDEX
+                index.map.clear();
+
+                index.set_segment_id();
+
+                for seg_id in 0..=index.get_segment_id() {
+                    let log_path = get_log_path(&seg_id);
+                    let mut file = match OpenOptions::new().read(true).open(log_path) {
+                        Ok(f) => f,
+                        Err(e) if e.kind() == ErrorKind::NotFound => break,
+                        Err(e) => return Err(e),
+                    };
+                    loop {
+                        let key_len = match read_u32(&mut file) {
+                            Ok(n) => n as usize,
+                            Err(e) if e.kind() == ErrorKind::UnexpectedEof => {
+                                // eprintln!("Incomplete or partial record entry at EOF; discarding");
+                                break;
+                            }
+                            Err(e) => return Err(e),
+                        };
+                        let val_len = match read_u32(&mut file) {
+                            Ok(n) => n as usize,
+                            Err(e) if e.kind() == ErrorKind::UnexpectedEof => {
+                                eprintln!("Incomplete or partial record entry in log; discarding");
+                                break;
+                            }
+                            Err(e) => return Err(e),
+                        };
+                        let key = match read_bytes(&mut file, key_len)? {
+                            Some(data) => data,
+                            None => {
+                                eprintln!("Incomplete or partial record entry in log; discarding");
+                                break;
+                            }
+                        };
+
+                        let value_offset = file.stream_position()?;
+                        // moves the cursor to end of value bytes so next read doesnt
+                        // start form the middle of value bytes
+                        file.seek(std::io::SeekFrom::Current(val_len as i64))?;
+                        index.insert(key, value_offset, val_len, seg_id);
+                    }
+                }
+                println!("{:?} INDEX FILLED MAP", index.map);
+
+                //NEW LOG WRITER
+                log_writer = LogWriter::new(&get_log_path(&index.get_segment_id()))?;
+            }
+
             Some("QUIT") => {
                 log_writer.flush_and_sync()?;
                 break;
@@ -197,4 +283,8 @@ fn read_bytes(reader: &mut impl Read, len: usize) -> std::io::Result<Option<Vec<
 
 pub fn get_log_path(segment_number: &u32) -> String {
     format!("{}{}.log", BASE_LOG_NAME, segment_number)
+}
+
+pub fn get_compact_log_path() -> String {
+    format!("{}_compact.log", BASE_LOG_NAME)
 }
